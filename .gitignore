@@ -6,3 +6,5 @@ inst/**/.DS_Store
 src/*.o
 src/*.so
 src/*.dll
+
+/.quarto/
