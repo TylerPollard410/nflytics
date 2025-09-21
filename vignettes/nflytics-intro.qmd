@@ -1,0 +1,230 @@
+---
+title: "Getting Started with nflytics"
+format: html
+engine: knitr
+jupyter: false
+vignette: >
+  %\VignetteIndexEntry{Getting Started with nflytics}
+  %\VignetteEngine{quarto::quarto}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>"
+)
+```
+
+## Overview
+
+The `nflytics` package bundles a latent team-strength state space model
+implemented in Stan together with R helpers for preparing game data,
+fitting the model with either `rstan` or `cmdstanr`, and post-processing
+posterior draws. This vignette walks through the core functions:
+
+- `prepare_latent_strength_data()` builds the Stan data list.
+- `fit_latent_strength()` runs the sampler with your preferred backend.
+- `nflytics_draws()`, `posterior_trajectory()`, and `as_stanfit()` help you
+  interrogate the fitted model.
+
+All code chunks that launch Stan sampling are marked with `eval = FALSE`
+so the vignette renders quickly; remove that option to execute them locally.
+
+## Packages
+
+```{r packages}
+library(nflytics)
+library(dplyr)
+library(tibble)
+library(ggplot2)
+library(bayesplot)
+```
+
+## Example Game Data
+
+We start with a small synthetic data frame containing four games across two
+seasons. In practice you would pull this from `nflverse` or your own
+pipeline, but the structure is the same: season, week, home/away teams, and
+scores.
+
+```{r example-data}
+example_games <- tibble::tribble(
+  ~season, ~week, ~home_team, ~away_team, ~home_score, ~away_score,
+     2023,     1,      "KC",      "DET",         20L,         21L,
+     2023,     1,      "BUF",      "NYJ",         17L,         16L,
+     2023,     2,      "KC",      "JAX",         23L,         13L,
+     2024,     1,      "KC",      "BUF",         27L,         24L
+)
+example_games
+```
+
+## Preparing Stan Data
+
+`prepare_latent_strength_data()` encodes categorical columns as integer
+indices, flags the first/last weeks of each season, and returns a list ready
+for Stan. The function stores lookup tables in attributes so you can map
+parameters back to meaningful labels later.
+
+```{r stan-data}
+stan_data <- prepare_latent_strength_data(example_games)
+str(stan_data, max.level = 1)
+attr(stan_data, "teams")
+attr(stan_data, "seasons")
+```
+
+## Sampling the Latent Strength Model
+
+### Using rstan
+
+```{r sample-rstan, eval=FALSE}
+fit_rstan <- fit_latent_strength(
+  stan_data,
+  engine = "rstan",
+  chains = 2,
+  iter_warmup = 500,
+  iter_sampling = 500,
+  adapt_delta = 0.95,
+  refresh = 100
+)
+```
+
+### Using cmdstanr
+
+```{r sample-cmdstanr, eval=FALSE}
+fit_cmdstan <- fit_latent_strength(
+  stan_data,
+  engine = "cmdstanr",
+  chains = 2,
+  parallel_chains = 2,
+  iter_warmup = 500,
+  iter_sampling = 500,
+  adapt_delta = 0.95,
+  refresh = 100
+)
+```
+
+The function returns objects of class `nflytics_fit` with these key
+components:
+
+- `$fit`: the backend-specific fit object (`stanfit` or `CmdStanMCMC`).
+- `$draws`: posterior samples as an array compatible with the `posterior`
+  package.
+- `$lookup`: team/season/week lookup tables for post-processing.
+
+## Accessing Posterior Draws
+
+`nflytics_draws()` converts the stored draws into any format supported by
+the `posterior` package. For example, you can get a tidy data frame of draws
+for downstream summarisation:
+
+```{r draws, eval=FALSE}
+posterior_df <- nflytics_draws(fit_cmdstan, format = "df")
+head(posterior_df)
+```
+
+If you fit with `rstan`, you can recover the underlying `stanfit` object to
+use other `rstantools` helpers (e.g. `posterior_predict()`):
+
+```{r as-stanfit, eval=FALSE}
+stanfit_obj <- as_stanfit(fit_rstan)
+```
+
+## Posterior Trajectories
+
+`posterior_trajectory()` mirrors the `posterior_trajectory()` interface from
+`rstanarm`, summarising latent team strength over time. By default it returns
+credible intervals per team-week combination.
+
+```{r trajectory, eval=FALSE}
+trajectory_summary <- posterior_trajectory(
+  fit_cmdstan,
+  summary = TRUE,
+  probs = c(0.1, 0.9)
+)
+trajectory_summary
+```
+
+Set `summary = FALSE` to obtain one row per posterior draw, which is useful
+for plotting ribbons with `tidybayes` or `ggplot2`.
+
+```{r trajectory-draws, eval=FALSE}
+trajectory_draws <- posterior_trajectory(
+  fit_cmdstan,
+  summary = FALSE
+)
+trajectory_draws
+```
+
+## Plotting Posterior Trajectories
+
+Once you have either the summary data or the raw draws, you can create tidy
+visualisations with `ggplot2`. The chunk below assumes you executed the
+`posterior_trajectory()` code above and have `trajectory_summary` available.
+
+```{r trajectory-plot, eval=FALSE}
+trajectory_summary %>%
+  ggplot(aes(
+    x = week,
+    y = mean,
+    ymin = lower,
+    ymax = upper,
+    colour = team,
+    fill = team
+  )) +
+  geom_ribbon(alpha = 0.15, colour = NA) +
+  geom_line(linewidth = 0.9) +
+  facet_wrap(~season, scales = "free_x") +
+  labs(
+    title = "Posterior team strength trajectories",
+    y = "Posterior mean with 80% interval",
+    x = "Week"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+If you prefer to visualise individual draws, combine
+`posterior_trajectory(summary = FALSE)` with `tidybayes::stat_lineribbon()`
+after filtering to the team(s) of interest.
+
+## Exploring Parameters with bayesplot
+
+The `bayesplot` package works seamlessly once you convert draws to a matrix
+via `nflytics_draws()`. Replace the parameter names below with those you
+want to inspect.
+
+```{r bayesplot-examples, eval=FALSE}
+posterior_matrix <- nflytics_draws(fit_cmdstan, format = "matrix")
+
+# Density overlay for two scale parameters
+bayesplot::mcmc_dens_overlay(
+  posterior_matrix,
+  pars = c("sigma_obs", "sigma_team_strength_init")
+)
+
+# Histogram for league-level persistence
+bayesplot::mcmc_hist(
+  posterior_matrix,
+  pars = "phi_league_hfa"
+)
+```
+
+For more ideas see the `bayesplot` reference manual, which includes rank
+plots, autocorrelation checks, and interval plots built on the same draws.
+
+## Generated Quantities and Forecasting
+
+The package also ships a standalone generated-quantities Stan program that
+shares the latent structure but allows you to append future weeks or
+out-of-sample matchups. You can locate it with
+`latent_strength_stan_file(gq = TRUE)` and feed it into `cmdstanr`'s
+`generate_quantities()` after fitting the core model.
+
+```{r gq-file}
+latent_strength_stan_file(gq = TRUE)
+```
+
+Refer to `posterior::as_draws_*()` and `bayesplot` for additional visual
+checks, and consider wrapping sampling calls in your own convenience
+functions once you settle on hyperparameter defaults.
