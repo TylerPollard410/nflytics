@@ -53,7 +53,14 @@ library(nflytics)
 # game_data is a data frame with season/week/team columns and scores
 stan_data <- prepare_latent_strength_data(game_data)
 fit <- fit_latent_strength(stan_data, engine = "cmdstanr")
-summary <- posterior_trajectory(fit, summary = TRUE)
+trajectory_draws <- posterior_trajectory(fit, draws_format = "df")
+trajectory_lookup <- attr(trajectory_draws, "trajectory_lookup")
+# Need summaries? leverage the posterior package helpers
+trajectory_summary <- posterior::summarise_draws(
+  trajectory_draws,
+  probs = c(0.1, 0.9)
+) |>
+  dplyr::left_join(trajectory_lookup, by = "variable")
 ```
 
 For more examples, see the vignette or the scripts under `dev/`.

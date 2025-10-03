@@ -1,11 +1,14 @@
 ---
 title: "Getting Started with nflytics"
-format: html
-engine: knitr
-jupyter: false
+format: 
+  html:
+    toc: true
+    html-math-method: mathjax
+# engine: knitr
+# jupyter: false
 vignette: >
   %\VignetteIndexEntry{Getting Started with nflytics}
-  %\VignetteEngine{quarto::quarto}
+  %\VignetteEngine{quarto::html}
   %\VignetteEncoding{UTF-8}
 ---
 
@@ -132,35 +135,55 @@ stanfit_obj <- as_stanfit(fit_rstan)
 
 ## Posterior Trajectories
 
-`posterior_trajectory()` mirrors the `posterior_trajectory()` interface from
-`rstanarm`, summarising latent team strength over time. By default it returns
-credible intervals per team-week combination.
+`posterior_trajectory()` filters the latent team-strength draws down to the
+teams, seasons, and weeks you care about. Request the draws as a
+`posterior` object and then summarise them with your preferred helper.
 
 ```{r trajectory, eval=FALSE}
-trajectory_summary <- posterior_trajectory(
+trajectory_draws <- posterior_trajectory(
   fit_cmdstan,
-  summary = TRUE,
-  probs = c(0.1, 0.9)
+  draws_format = "df"
 )
+trajectory_lookup <- attr(trajectory_draws, "trajectory_lookup")
+trajectory_summary <- posterior::summarise_draws(
+  trajectory_draws,
+  probs = c(0.1, 0.9)
+) |>
+  dplyr::left_join(trajectory_lookup, by = "variable") |>
+  dplyr::transmute(
+    team,
+    season,
+    week,
+    mean,
+    median,
+    sd,
+    lower = q10,
+    upper = q90
+  )
 trajectory_summary
 ```
 
-Set `summary = FALSE` to obtain one row per posterior draw, which is useful
-for plotting ribbons with `tidybayes` or `ggplot2`.
+To build a tidy long tibble of individual draws (handy for plotting), pivot the
+draws data frame and join the lookup metadata.
 
 ```{r trajectory-draws, eval=FALSE}
-trajectory_draws <- posterior_trajectory(
-  fit_cmdstan,
-  summary = FALSE
-)
-trajectory_draws
+trajectory_draws_long <- trajectory_draws |>
+  tibble::as_tibble() |>
+  tidyr::pivot_longer(
+    cols = tidyselect::starts_with("team_strength"),
+    names_to = "variable",
+    values_to = "value"
+  ) |>
+  dplyr::left_join(trajectory_lookup, by = "variable")
+trajectory_draws_long
 ```
 
 ## Plotting Posterior Trajectories
 
-Once you have either the summary data or the raw draws, you can create tidy
-visualisations with `ggplot2`. The chunk below assumes you executed the
-`posterior_trajectory()` code above and have `trajectory_summary` available.
+Once you have either the posterior summary or the raw draws, you can create
+tidy visualisations with `ggplot2`. The chunk below assumes you executed the
+`posterior::summarise_draws()` example above and have `trajectory_summary`
+available.
 
 ```{r trajectory-plot, eval=FALSE}
 trajectory_summary %>%
@@ -184,9 +207,9 @@ trajectory_summary %>%
   theme(legend.position = "bottom")
 ```
 
-If you prefer to visualise individual draws, combine
-`posterior_trajectory(summary = FALSE)` with `tidybayes::stat_lineribbon()`
-after filtering to the team(s) of interest.
+If you prefer to visualise individual draws, combine the tibble returned by
+`posterior_trajectory()` with `tidybayes::stat_lineribbon()` after filtering to
+the team(s) of interest.
 
 ## Exploring Parameters with bayesplot
 

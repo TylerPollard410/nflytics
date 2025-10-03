@@ -12,7 +12,10 @@ latent_strength_stan_file <- function(gq = FALSE) {
 
   path <- system.file("stan", file_name, package = "nflytics")
   if (!nzchar(path)) {
-    stop(sprintf("Stan file '%s' is not available inside the package.", file_name), call. = FALSE)
+    stop(
+      sprintf("Stan file '%s' is not available inside the package.", file_name),
+      call. = FALSE
+    )
   }
   path
 }
@@ -60,8 +63,15 @@ prepare_latent_strength_data <- function(
     stop("`data` must be a data frame.", call. = FALSE)
   }
 
-  required <- c(season_col, week_col, home_team_col, away_team_col,
-                home_score_col, away_score_col)
+  required <- c(
+    season_col,
+    week_col,
+    home_team_col,
+    away_team_col,
+    home_score_col,
+    away_score_col,
+    result_col
+  )
   missing_cols <- setdiff(required, colnames(data))
   if (length(missing_cols)) {
     stop(
@@ -73,7 +83,31 @@ prepare_latent_strength_data <- function(
     )
   }
 
-  df <- data[, unique(c(required, result_col, total_col, hfa_col)), drop = FALSE]
+  df <- data[,
+    unique(c(required, result_col, total_col, hfa_col)),
+    drop = FALSE
+  ]
+
+  required_filter <- c(home_score_col, away_score_col)
+  complete_required <- stats::complete.cases(df[,
+    required_filter,
+    drop = FALSE
+  ])
+  removed <- sum(!complete_required)
+  if (removed > 0) {
+    cli::cli_warn(c(
+      "Dropping rows with missing values in required columns before building Stan data.",
+      "i" = sprintf("Rows removed: %s", removed)
+    ))
+    df <- df[complete_required, , drop = FALSE]
+  }
+
+  if (!nrow(df)) {
+    stop(
+      "After removing rows with missing required values no data remains for Stan.",
+      call. = FALSE
+    )
+  }
 
   df <- dplyr::mutate(
     df,
@@ -127,7 +161,10 @@ prepare_latent_strength_data <- function(
     )
 
   if (anyNA(df$home_idx) || anyNA(df$away_idx)) {
-    stop("Every team must appear in `teams`; consider supplying the `teams` argument.", call. = FALSE)
+    stop(
+      "Every team must appear in `teams`; consider supplying the `teams` argument.",
+      call. = FALSE
+    )
   }
 
   season_lookup <- df |>
@@ -186,7 +223,7 @@ prepare_latent_strength_data <- function(
 
   if (isTRUE(verbose)) {
     cli::cli_inform(c(
-      "Preparing Stan data", 
+      "Preparing Stan data",
       "i" = sprintf("Games: %s", stan_data$N_games),
       "i" = sprintf("Teams: %s", stan_data$N_teams),
       "i" = sprintf("Seasons: %s", stan_data$N_seasons),
@@ -223,7 +260,10 @@ fit_latent_strength <- function(
   iter_warmup = 1000,
   iter_sampling = 1000,
   chains = 4,
-  parallel_chains = min(chains, max(1, parallel::detectCores(logical = FALSE) - 1)),
+  parallel_chains = min(
+    chains,
+    max(1, parallel::detectCores(logical = FALSE) - 1)
+  ),
   seed = NULL,
   refresh = 50,
   adapt_delta = 0.9,
@@ -238,7 +278,10 @@ fit_latent_strength <- function(
   }
 
   if (!is.list(stan_data) || is.null(stan_data$N_games)) {
-    stop("`data` must be either a data frame or a Stan data list created by prepare_latent_strength_data().", call. = FALSE)
+    stop(
+      "`data` must be either a data frame or a Stan data list created by prepare_latent_strength_data().",
+      call. = FALSE
+    )
   }
 
   engine <- match.arg(engine)
@@ -302,6 +345,233 @@ fit_latent_strength <- function(
   out
 }
 
+#' Run generated quantities for the latent strength model
+#'
+#' @description
+#' Executes the standalone generated-quantities program
+#' `latent_strength_ssm_gq.stan` using an existing `nflytics_fit` so that
+#' out-of-sample forecasts can be produced without refitting the core model.
+#'
+#' @param object An `nflytics_fit` created by [fit_latent_strength()]. Only
+#'   fits obtained with `engine = "cmdstanr"` are supported.
+#' @param schedule_idx Data frame describing the game schedule with the index
+#'   columns expected by [prepare_schedule_indices()], including (at minimum)
+#'   `season_idx`, `week_idx`, `fw_season_idx`, `lw_season_idx`, `home_idx`,
+#'   `away_idx`, and `hfa`. Additional descriptive columns such as
+#'   `season`, `week`, `home_team`, and `away_team` are preserved and attached
+#'   to the result for downstream summaries.
+#' @param targets Vector of global `week_idx` values identifying the games to
+#'   forecast, or a data frame with columns `season` and `week` that can be
+#'   matched against `schedule_idx`. When `NULL`, supply `horizon` to request
+#'   the next `horizon` weeks automatically.
+#' @param horizon Optional integer specifying how many weeks beyond the fitted
+#'   window to score. Ignored when `targets` is supplied.
+#' @param gq_model Optional pre-compiled CmdStan model returned by
+#'   [cmdstanr::cmdstan_model()]. When omitted the helper compiles (or reuses)
+#'   `latent_strength_ssm_gq.stan`.
+#' @param seed Optional RNG seed forwarded to
+#'   [cmdstanr::generate_quantities()]. Defaults to the seed stored on the fit
+#'   object when available.
+#' @param parallel_chains Optional number of parallel chains used by
+#'   `generate_quantities()`. By default the function reuses the number of fit
+#'   chains (bounded by the detected core count).
+#' @param sig_figs Optional significant-figure setting passed to
+#'   `generate_quantities()`.
+#' @param refresh Frequency for CmdStan progress output. Defaults to `0` (no
+#'   progress messages).
+#' @param ... Additional arguments forwarded to
+#'   [cmdstanr::generate_quantities()].
+#'
+#' @return A `CmdStanGQ` object. The result is tagged with the schedule rows
+#'   used for scoring (`attr(, "oos_schedule")`), the resolved `week_idx`
+#'   targets (`attr(, "targets")`), and the full data list supplied to Stan
+#'   (`attr(, "gq_data")`).
+#' @export
+gq_latent_strength <- function(
+  object,
+  schedule_idx,
+  targets = NULL,
+  horizon = NULL,
+  gq_model = NULL,
+  seed = NULL,
+  parallel_chains = NULL,
+  sig_figs = NULL,
+  refresh = 0,
+  ...
+) {
+  if (!inherits(object, "nflytics_fit")) {
+    stop("Object is not an nflytics_fit result.", call. = FALSE)
+  }
+  if (!identical(object$engine, "cmdstanr")) {
+    stop(
+      "latent_strength_generate_quantities() currently requires engine = 'cmdstanr'.",
+      call. = FALSE
+    )
+  }
+  if (missing(schedule_idx) || !is.data.frame(schedule_idx)) {
+    stop(
+      "`schedule_idx` must be a data frame produced by prepare_schedule_indices().",
+      call. = FALSE
+    )
+  }
+
+  required_cols <- c(
+    "season_idx",
+    "week_idx",
+    "fw_season_idx",
+    "lw_season_idx",
+    "home_idx",
+    "away_idx",
+    "hfa"
+  )
+  missing_cols <- setdiff(required_cols, colnames(schedule_idx))
+  if (length(missing_cols)) {
+    stop(
+      sprintf(
+        "`schedule_idx` is missing required columns: %s",
+        paste(missing_cols, collapse = ", ")
+      ),
+      call. = FALSE
+    )
+  }
+
+  if (!is.null(targets) && !is.null(horizon)) {
+    stop("Supply either `targets` or `horizon`, not both.", call. = FALSE)
+  }
+
+  if (is.null(targets)) {
+    if (is.null(horizon)) {
+      stop("Provide either `targets` or `horizon`.", call. = FALSE)
+    }
+    targets <- next_week_targets(object$data, horizon = horizon)
+  } else if (is.data.frame(targets)) {
+    if (!all(c("season", "week") %in% names(targets))) {
+      stop(
+        "When `targets` is a data frame it must contain `season` and `week` columns.",
+        call. = FALSE
+      )
+    }
+    lookup <- unique(schedule_idx[, c("season", "week", "week_idx")])
+    merged <- merge(
+      unique(targets[, c("season", "week"), drop = FALSE]),
+      lookup,
+      by = c("season", "week"),
+      all.x = TRUE,
+      sort = FALSE
+    )
+    if (anyNA(merged$week_idx)) {
+      missing_rows <- merged[
+        is.na(merged$week_idx),
+        c("season", "week"),
+        drop = FALSE
+      ]
+      stop(
+        sprintf(
+          "Unable to find week_idx values for %s.",
+          paste(
+            paste(missing_rows$season, missing_rows$week, sep = " week "),
+            collapse = "; "
+          )
+        ),
+        call. = FALSE
+      )
+    }
+    targets <- merged$week_idx
+  }
+
+  targets <- sort(unique(as.integer(targets)))
+  if (!length(targets)) {
+    stop("No target weeks supplied for generated quantities.", call. = FALSE)
+  }
+
+  oos_subset <- schedule_idx[schedule_idx$week_idx %in% targets, , drop = FALSE]
+  oos_subset <- oos_subset[order(oos_subset$week_idx), , drop = FALSE]
+  if (!nrow(oos_subset)) {
+    stop(
+      "No schedule rows matched the requested targets. Check `schedule_idx` and `targets`.",
+      call. = FALSE
+    )
+  }
+
+  gq_data <- prepare_gq_data(object$data, schedule_idx, targets)
+
+  if (is.null(gq_model)) {
+    gq_model <- cmdstanr::cmdstan_model(latent_strength_stan_file(TRUE))
+  } else if (!inherits(gq_model, "CmdStanModel")) {
+    stop("`gq_model` must be a CmdStanModel object.", call. = FALSE)
+  }
+
+  if (is.null(seed) && !is.null(object$metadata$seed)) {
+    seed <- object$metadata$seed
+  }
+  if (!is.null(seed)) {
+    seed <- as.integer(seed)
+  }
+
+  if (is.null(parallel_chains)) {
+    chains <- object$metadata$chains
+    if (is.null(chains) && inherits(object$fit, "CmdStanMCMC")) {
+      chains <- object$fit$num_chains()
+    }
+    if (is.null(chains)) {
+      chains <- 4L
+    }
+    cores <- try(parallel::detectCores(), silent = TRUE)
+    if (inherits(cores, "try-error") || is.na(cores)) {
+      cores <- chains
+    }
+    parallel_chains <- max(1L, min(as.integer(chains), as.integer(cores)))
+  } else {
+    parallel_chains <- as.integer(parallel_chains)
+  }
+
+  args <- list(
+    fitted_params = object$fit,
+    data = gq_data,
+    parallel_chains = parallel_chains,
+    refresh = refresh
+  )
+  if (!is.null(seed)) {
+    args$seed <- seed
+  }
+  if (!is.null(sig_figs)) {
+    args$sig_figs <- as.integer(sig_figs)
+  }
+  extra <- list(...)
+  if (length(extra)) {
+    args <- c(args, extra)
+  }
+
+  gq_obj <- do.call(gq_model$generate_quantities, args)
+  attr(gq_obj, "targets") <- targets
+  attr(gq_obj, "oos_schedule") <- oos_subset
+  attr(gq_obj, "gq_data") <- gq_data
+  gq_obj
+}
+
+#' Print method for nflytics fits
+#' @export
+print.nflytics_fit <- function(x, ...) {
+  cat("nflytics latent strength fit\n")
+  cat(sprintf("  Engine: %s\n", x$engine))
+  cat(sprintf("  Chains: %s\n", x$metadata$chains))
+  cat(sprintf(
+    "  Iterations: warmup %s / sampling %s\n",
+    x$metadata$iter_warmup,
+    x$metadata$iter_sampling
+  ))
+  cat(sprintf("  Games: %s\n", x$data$N_games))
+  if (identical(x$engine, "rstan")) {
+    cat("\nStan summary (first 5 parameters):\n")
+    summ <- rstan::summary(x$fit)$summary
+    print(utils::head(summ, 5))
+  } else if (inherits(x$fit, "CmdStanMCMC")) {
+    cat("\nCmdStan summary (first 5 parameters):\n")
+    x$fit$print(...)
+  }
+  invisible(x)
+}
+
 #' Extract the underlying stanfit object
 #'
 #' @param object An `nflytics_fit` object.
@@ -317,7 +587,10 @@ as_stanfit.nflytics_fit <- function(object, ...) {
     stop("Object is not an nflytics_fit result.", call. = FALSE)
   }
   if (!identical(object$engine, "rstan")) {
-    stop("The underlying stanfit is only available when fitting with engine = 'rstan'.", call. = FALSE)
+    stop(
+      "The underlying stanfit is only available when fitting with engine = 'rstan'.",
+      call. = FALSE
+    )
   }
   object$fit
 }
@@ -327,7 +600,10 @@ as_stanfit.nflytics_fit <- function(object, ...) {
 #' @param object An `nflytics_fit` object.
 #' @param format Output format recognised by the posterior package.
 #' @export
-nflytics_draws <- function(object, format = c("array", "df", "matrix", "list", "rvar")) {
+nflytics_draws <- function(
+  object,
+  format = c("array", "df", "matrix", "list", "rvar")
+) {
   format <- match.arg(format)
   if (!inherits(object, "nflytics_fit")) {
     stop("Object is not an nflytics_fit result.", call. = FALSE)
@@ -347,11 +623,17 @@ nflytics_draws <- function(object, format = c("array", "df", "matrix", "list", "
 #' @param object An `nflytics_fit` object.
 #' @param teams Optional character vector limiting the output to specific team
 #'   abbreviations.
-#' @param summary Whether to aggregate draws to summary statistics.
-#' @param probs Credible interval bounds used when `summary = TRUE`.
-#' @param draws Logical. When `TRUE` and `summary = FALSE`, retain the original
-#'   draw identifiers alongside the latent trajectory values.
-#' @return A tibble containing posterior summaries for team strength trajectories.
+#' @param seasons Optional integer vector restricting the output to specific
+#'   seasons.
+#' @param weeks Optional integer vector restricting the output to specific week
+#'   numbers (within the retained seasons).
+#' @param draws_format Format for the returned draws. Supported options are
+#'   `"df"`, `"matrix"`, `"array"`, and `"list"`. Defaults to `"df"`.
+#'
+#' @return A filtered draws object of the requested format. The result is tagged
+#'   with `trajectory_lookup`, a tibble mapping parameter names to
+#'   `team`/`season`/`week`, and `trajectory_filters`, the original filters that
+#'   were applied.
 #' @export
 posterior_trajectory <- function(object, ...) {
   UseMethod("posterior_trajectory")
@@ -361,85 +643,105 @@ posterior_trajectory <- function(object, ...) {
 posterior_trajectory.nflytics_fit <- function(
   object,
   teams = NULL,
-  summary = TRUE,
-  probs = c(0.1, 0.9),
-  draws = FALSE,
+  seasons = NULL,
+  weeks = NULL,
+  draws_format = c("df", "matrix", "array", "list"),
   ...
 ) {
   if (!inherits(object, "nflytics_fit")) {
     stop("Object is not an nflytics_fit result.", call. = FALSE)
   }
 
-  draws_array <- posterior::subset_draws(object$draws, variable = "team_strength")
-  draws_df <- posterior::as_draws_df(draws_array)
-  draws_df <- tibble::as_tibble(draws_df)
-
-  value_cols <- setdiff(colnames(draws_df), c(".chain", ".iteration", ".draw"))
-  if (!length(value_cols)) {
-    stop("No team strength draws found in the fitted object.", call. = FALSE)
-  }
-
-  tidy <- tidyr::pivot_longer(
-    draws_df,
-    cols = dplyr::all_of(value_cols),
-    names_to = "variable",
-    values_to = "value"
-  )
-
-  index_str <- gsub("team_strength\\[|\\]", "", tidy$variable)
-  idx <- do.call(rbind, strsplit(index_str, ",", fixed = TRUE))
-  tidy$week_idx <- as.integer(idx[, 1, drop = TRUE])
-  tidy$team_idx <- as.integer(idx[, 2, drop = TRUE])
-
   lookup_teams <- object$lookup$teams
   lookup_weeks <- object$lookup$weeks
 
-  tidy <- tidy |>
-    dplyr::left_join(lookup_teams, by = c("team_idx" = "team_idx")) |>
-    dplyr::left_join(lookup_weeks, by = c("week_idx" = "week_idx"))
-
+  team_lookup <- lookup_teams
   if (!is.null(teams)) {
-    tidy <- tidy |> dplyr::filter(team %in% teams)
+    team_lookup <- team_lookup |> dplyr::filter(team %in% teams)
   }
-
-  if (isTRUE(summary)) {
-    summarised <- tidy |>
-      dplyr::group_by(team, season, week) |>
-      dplyr::summarise(
-        mean = mean(value),
-        median = stats::median(value),
-        sd = stats::sd(value),
-        lower = stats::quantile(value, probs = min(probs)),
-        upper = stats::quantile(value, probs = max(probs)),
-        .groups = "drop"
-      ) |>
-      dplyr::arrange(season, week, team)
-    return(summarised)
+  if (!nrow(team_lookup)) {
+    stop("No teams remain after filtering; check `teams` input.", call. = FALSE)
   }
+  team_lookup <- team_lookup |> dplyr::mutate(team_pos = dplyr::row_number())
 
-  if (!isTRUE(draws)) {
-    tidy <- tidy |> dplyr::select(-.chain, -.iteration)
+  week_lookup <- lookup_weeks
+  if (!is.null(seasons)) {
+    week_lookup <- week_lookup |> dplyr::filter(season %in% seasons)
   }
-
-  tidy |>
-    dplyr::arrange(.draw, team, season, week)
-}
-
-#' Print method for nflytics fits
-#' @export
-print.nflytics_fit <- function(x, ...) {
-  cat("nflytics latent strength fit\n")
-  cat(sprintf("  Engine: %s\n", x$engine))
-  cat(sprintf("  Chains: %s\n", x$metadata$chains))
-  cat(sprintf("  Iterations: warmup %s / sampling %s\n", x$metadata$iter_warmup, x$metadata$iter_sampling))
-  cat(sprintf("  Games: %s\n", x$data$N_games))
-  if (identical(x$engine, "rstan")) {
-    cat("\nStan summary (first 5 parameters):\n")
-    summ <- rstan::summary(x$fit)$summary
-    print(utils::head(summ, 5))
-  } else if (inherits(x$fit, "CmdStanMCMC")) {
-    cat("\nCmdStan summary (first 5 parameters):\n")
-    print(head(x$fit$summary(), 5))
+  if (!is.null(weeks)) {
+    week_lookup <- week_lookup |> dplyr::filter(week %in% weeks)
   }
-  invisible(x)
+  if (!nrow(week_lookup)) {
+    stop(
+      "No weeks remain after filtering; check `seasons`/`weeks` inputs.",
+      call. = FALSE
+    )
+  }
+  week_lookup <- week_lookup |>
+    dplyr::arrange(season_idx, week_idx) |>
+    dplyr::mutate(week_pos = dplyr::row_number())
+
+  week_grid <- week_lookup |> dplyr::select(week_idx, week_pos, season, week)
+  team_grid <- team_lookup |> dplyr::select(team_idx, team_pos, team)
+
+  var_grid <- tidyr::crossing(week_grid, team_grid) |>
+    dplyr::mutate(
+      variable_orig = sprintf("team_strength[%s,%s]", week_idx, team_idx),
+      variable = sprintf("team_strength[%s,%s]", week_pos, team_pos)
+    )
+
+  draws_array <- posterior::subset_draws(
+    object$draws,
+    variable = unique(var_grid$variable_orig)
+  )
+
+  variables_orig <- posterior::variables(draws_array)
+  mapping <- var_grid |>
+    dplyr::filter(variable_orig %in% variables_orig)
+  mapping <- mapping[
+    match(variables_orig, mapping$variable_orig),
+    ,
+    drop = FALSE
+  ]
+
+  rename_args <- as.list(stats::setNames(
+    mapping$variable_orig,
+    mapping$variable
+  ))
+  draws_array <- do.call(
+    posterior::rename_variables,
+    c(list(draws_array), rename_args)
+  )
+
+  draw_fmt <- match.arg(draws_format)
+  out <- switch(
+    draw_fmt,
+    df = posterior::as_draws_df(draws_array),
+    matrix = posterior::as_draws_matrix(draws_array),
+    array = posterior::as_draws_array(draws_array),
+    list = posterior::as_draws_list(draws_array)
+  )
+
+  lookup_tbl <- mapping |>
+    dplyr::mutate(variable = as.character(variable)) |>
+    dplyr::select(
+      variable,
+      variable_orig,
+      team,
+      team_idx,
+      team_pos,
+      season,
+      week,
+      week_idx,
+      week_pos
+    )
+
+  attr(out, "trajectory_lookup") <- lookup_tbl
+  attr(out, "trajectory_filters") <- list(
+    teams = teams,
+    seasons = seasons,
+    weeks = weeks
+  )
+
+  out
 }

@@ -12,15 +12,20 @@ posterior_trajectory(object, ...)
 \item{teams}{Optional character vector limiting the output to specific team
 abbreviations.}
 
-\item{summary}{Whether to aggregate draws to summary statistics.}
+\item{seasons}{Optional integer vector restricting the output to specific
+seasons.}
 
-\item{probs}{Credible interval bounds used when \code{summary = TRUE}.}
+\item{weeks}{Optional integer vector restricting the output to specific week
+numbers (within the retained seasons).}
 
-\item{draws}{Logical. When \code{TRUE} and \code{summary = FALSE}, retain the original
-draw identifiers alongside the latent trajectory values.}
+\item{draws_format}{Format for the returned draws. Supported options are
+\code{"df"}, \code{"matrix"}, \code{"array"}, and \code{"list"}. Defaults to \code{"df"}.}
 }
 \value{
-A tibble containing posterior summaries for team strength trajectories.
+A filtered draws object of the requested format. The result is tagged
+with \code{trajectory_lookup}, a tibble mapping parameter names to
+\code{team}/\code{season}/\code{week}, and \code{trajectory_filters}, the original filters that
+were applied.
 }
 \description{
 Posterior trajectory summary for latent team strength
